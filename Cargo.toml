@@ -1,0 +1,12 @@
+[package]
+name = "screen-time-daemon-rs"
+version = "0.1.0"
+authors = ["julian"]
+edition = "2018"
+
+[dependencies]
+dirs = "1.0.4"
+chrono = "0.4.6"
+
+# [profile.release]
+# opt-level = "s"
