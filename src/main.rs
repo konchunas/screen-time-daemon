@@ -1,12 +1,13 @@
 use std::fs::create_dir;
-use std::io::Write;
-use std::io::{Seek, SeekFrom};
+use std::fs::File;
+use std::io::{Seek, SeekFrom, Write};
 use std::time::SystemTime;
 
 use std::fs::OpenOptions;
+use std::path::PathBuf;
 use std::process::Command;
 
-use chrono::{DateTime, Utc};
+use chrono::{Date, Local};
 
 static DELIM: &'static str = ";";
 
@@ -16,10 +17,39 @@ enum DaemonError {
     XpropClassParse,
 }
 
+//activity frame
+#[derive(Debug)]
 pub struct Frame {
     name: String,
     start: u64,
     end: u64,
+}
+
+#[derive(Debug)]
+struct CurrentState {
+    last_frame: Option<Frame>,
+    last_line_length: usize,
+    last_date: Date<Local>,
+    file: File,
+}
+
+impl CurrentState {
+    pub fn new(path: &PathBuf) -> Self {
+        let filename = format!("{}.csv", Local::today().format("%b-%e-%Y"));
+
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(path.join(filename))
+            .expect("Cannot open or create todays screen time log");
+
+        CurrentState {
+            last_frame: None,
+            last_line_length: 0usize,
+            last_date: Local::today(),
+            file: file,
+        }
+    }
 }
 
 fn main() {
@@ -29,57 +59,62 @@ fn main() {
         create_dir(path_buf.as_path()).expect("cannot create .screen-time folder in your HOME");
     }
 
-    let now: DateTime<Utc> = Utc::now();
+    let mut very_first_loop = true;
 
-    let today_date = now.format("%b-%e-%Y");
-    let filename = format!("{}.csv", today_date);
-    path_buf.push(filename);
-
-    // println!("{:?}", path_buf);
-
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .open(path_buf)
-        .expect("Cannot open todays screen time log");
-
-    let mut last_frame: Option<Frame> = None;
-    let mut last_line_length = 0usize;
+    let mut state = CurrentState::new(&path_buf);
 
     loop {
+        if !very_first_loop {
+            //wait for timeout on every consequtive loop cycle
+            //it stays on top of the loop so "continue" will also wait for timeout
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+        very_first_loop = false;
+
+        if state.last_date != Local::today() {
+            println!("New day! Switching to new file");
+            state = CurrentState::new(&path_buf);
+        }
+
         let active_app_name = request_active_app_name();
         if let Err(err) = active_app_name {
             eprintln!("Error reading active app name, {:?}", err);
             continue;
         };
         let active_app_name = active_app_name.unwrap();
-        println!("{}", active_app_name);
 
-        let frame = compose_frame(&last_frame, &active_app_name);
+        println!("Active app name: {}", active_app_name);
+
+        if should_ignore_app(&active_app_name) {
+            continue;
+        }
+
+        let frame = compose_frame(&state.last_frame, &active_app_name);
 
         if frame.end == 0 {
-            last_frame = Some(frame);
+            state.last_frame = Some(frame);
             continue; //user spent less than minimum amount of time here
         }
 
         let string = frame_to_string(&frame);
 
         //improve this logic to be more readable
-        if let Some(last_frame) = last_frame {
+        if let Some(last_frame) = state.last_frame {
             if last_frame.end != 0 {
                 if active_app_name == last_frame.name {
-                    let _ = file.seek(SeekFrom::End(-(last_line_length as i64))).unwrap();
+                    let _ = state
+                        .file
+                        .seek(SeekFrom::End(-(state.last_line_length as i64)))
+                        .unwrap();
                 }
             }
         }
 
-        last_frame = Some(frame);
-        last_line_length = string.len();
+        state.last_frame = Some(frame);
+        state.last_line_length = string.len();
 
-        file.write(string.as_bytes());
-        file.sync_data();
-
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        state.file.write(string.as_bytes());
+        state.file.sync_data();
     }
 }
 
@@ -102,6 +137,20 @@ fn compose_frame(last_frame: &Option<Frame>, name: &str) -> Frame {
     }
 
     frame
+}
+
+fn should_ignore_app(app_name: &str) -> bool {
+    if app_name.len() == 1 {
+        return true;
+    }
+
+    let system_apps = &["Desktop", "unity-panel", "wingpanel"];
+    if system_apps.iter().position(|&name| name == app_name).is_some() {
+        println!("Ignoring system app");
+        return true;
+    }
+
+    return false;
 }
 
 fn frame_to_string(frame: &Frame) -> String {
