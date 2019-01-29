@@ -1,15 +1,17 @@
-use std::fs::create_dir;
-use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use std::fs::OpenOptions;
+use std::fs;
+use std::fs::{create_dir, File, OpenOptions};
+
 use std::path::PathBuf;
 use std::process::Command;
 
-use chrono::{Date, Local};
+use chrono::{Date, Local, NaiveDate};
 
 static DELIM: &'static str = ";";
+static TIMEOUT: u64 = 3;
+static DATE_FORMAT: &'static str = "%b-%e-%Y";
 
 #[derive(Debug)]
 enum DaemonError {
@@ -25,17 +27,23 @@ pub struct Frame {
     end: u64,
 }
 
+pub enum FrameOperation {
+    Prepare(Frame),
+    WriteNew(Frame),
+    UpdatePrevious(u64),
+}
+
 #[derive(Debug)]
 struct CurrentState {
     last_frame: Option<Frame>,
-    last_line_length: usize,
+    last_write_length: usize,
     last_date: Date<Local>,
     file: File,
 }
 
 impl CurrentState {
     pub fn new(path: &PathBuf) -> Self {
-        let filename = format!("{}.csv", Local::today().format("%b-%e-%Y"));
+        let filename = format!("{}.csv", Local::today().format(DATE_FORMAT));
 
         let file = OpenOptions::new()
             .write(true)
@@ -45,7 +53,7 @@ impl CurrentState {
 
         CurrentState {
             last_frame: None,
-            last_line_length: 0usize,
+            last_write_length: 0usize,
             last_date: Local::today(),
             file: file,
         }
@@ -57,6 +65,8 @@ fn main() {
     path_buf.push(".screen-time");
     if !path_buf.exists() {
         create_dir(path_buf.as_path()).expect("cannot create .screen-time folder in your HOME");
+    } else {
+        clean_up_old_logs(&path_buf);
     }
 
     let mut very_first_loop = true;
@@ -67,13 +77,14 @@ fn main() {
         if !very_first_loop {
             //wait for timeout on every consequtive loop cycle
             //it stays on top of the loop so "continue" will also wait for timeout
-            std::thread::sleep(std::time::Duration::from_secs(3));
+            std::thread::sleep(Duration::from_secs(TIMEOUT));
         }
         very_first_loop = false;
 
         if state.last_date != Local::today() {
             println!("New day! Switching to new file");
             state = CurrentState::new(&path_buf);
+            clean_up_old_logs(&path_buf);
         }
 
         let active_app_name = request_active_app_name();
@@ -89,54 +100,80 @@ fn main() {
             continue;
         }
 
-        let frame = compose_frame(&state.last_frame, &active_app_name);
+        let frame_op = decide(&state.last_frame, &active_app_name);
 
-        if frame.end == 0 {
-            state.last_frame = Some(frame);
-            continue; //user spent less than minimum amount of time here
-        }
-
-        let string = frame_to_string(&frame);
-
-        //improve this logic to be more readable
-        if let Some(last_frame) = state.last_frame {
-            if last_frame.end != 0 {
-                if active_app_name == last_frame.name {
-                    let _ = state
-                        .file
-                        .seek(SeekFrom::End(-(state.last_line_length as i64)))
-                        .unwrap();
-                }
+        let last_frame = match frame_op {
+            FrameOperation::Prepare(frame) => frame,
+            FrameOperation::WriteNew(frame) => {
+                let main_part = format!("{}{}{}{}", frame.name, DELIM, frame.start, DELIM);
+                state
+                    .file
+                    .write(main_part.as_bytes())
+                    .expect("Error writing to file");
+                state.last_write_length = write_timestamp_and_flush(&mut state.file, frame.end);
+                frame
             }
-        }
+            FrameOperation::UpdatePrevious(timestamp) => {
+                let last_frame = state.last_frame.unwrap();
+                let frame = Frame {
+                    name: last_frame.name.clone(),
+                    start: last_frame.start,
+                    end: timestamp,
+                };
+                //seek back last timestamp so it can be overwritten
+                let _ = state
+                    .file
+                    .seek(SeekFrom::End(-(state.last_write_length as i64)))
+                    .unwrap();
+                state.last_write_length = write_timestamp_and_flush(&mut state.file, timestamp);
+                frame
+            }
+        };
 
-        state.last_frame = Some(frame);
-        state.last_line_length = string.len();
-
-        state.file.write(string.as_bytes());
-        state.file.sync_data();
+        state.last_frame = Some(last_frame);
     }
 }
 
-fn compose_frame(last_frame: &Option<Frame>, name: &str) -> Frame {
+fn write_timestamp_and_flush(file: &mut File, timestamp: u64) -> usize {
+    let time_str = format!("{}\n", timestamp);
+    let res = file.write(time_str.as_bytes());
+    let written_bytes = res.unwrap();
+    file.sync_data().expect("Cannot flush data to file");
+    written_bytes
+}
+
+fn decide(last_frame: &Option<Frame>, name: &str) -> FrameOperation {
     let timestamp = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap();
     let timestamp = timestamp.as_secs();
-    let mut frame = Frame {
-        name: name.to_string(),
-        start: timestamp,
-        end: 0,
-    };
 
+    //try to continue previous frame
     if let Some(last_frame) = last_frame {
         if last_frame.name == name {
-            frame.start = last_frame.start;
-            frame.end = timestamp;
+            if last_frame.end == last_frame.start {
+                return FrameOperation::WriteNew(Frame {
+                    name: name.to_string(),
+                    start: last_frame.start,
+                    end: timestamp,
+                });
+            }
+            if timestamp - last_frame.end < TIMEOUT * 5 {
+                return FrameOperation::UpdatePrevious(timestamp);
+            } else {
+                //computer must have been suspended, do not track that as usage
+                println!("Too much time passed between this app last logged. Creating new record");
+                println!("It was {} seconds", timestamp - last_frame.end);
+            }
         }
     }
 
-    frame
+    //create new frame
+    FrameOperation::Prepare(Frame {
+        name: name.to_string(),
+        start: timestamp,
+        end: timestamp,
+    })
 }
 
 fn should_ignore_app(app_name: &str) -> bool {
@@ -145,20 +182,16 @@ fn should_ignore_app(app_name: &str) -> bool {
     }
 
     let system_apps = &["Desktop", "unity-panel", "wingpanel"];
-    if system_apps.iter().position(|&name| name == app_name).is_some() {
+    if system_apps
+        .iter()
+        .position(|&name| name == app_name)
+        .is_some()
+    {
         println!("Ignoring system app");
         return true;
     }
 
     return false;
-}
-
-fn frame_to_string(frame: &Frame) -> String {
-    let result = format!(
-        "{}{}{}{}{}\n",
-        frame.name, DELIM, frame.start, DELIM, frame.end
-    );
-    return result;
 }
 
 fn request_active_app_name() -> Result<String, DaemonError> {
@@ -194,4 +227,46 @@ fn request_active_app_name() -> Result<String, DaemonError> {
 fn get_last_word(string: String) -> String {
     let words = string.split(" ");
     return words.last().unwrap().to_string();
+}
+
+fn clean_up_old_logs(path: &PathBuf) {
+    let last_allowed_date = Local::today() - chrono::Duration::days(7);
+    let last_allowed_date = last_allowed_date.naive_local();
+    let file_format = format!("{}.csv", DATE_FORMAT);
+
+    for file in std::fs::read_dir(path).unwrap() {
+        if let Err(err) = file {
+            eprintln!("Cleanup: Error accesing filename of {}", err);
+            continue;
+        }
+        let file = file.unwrap();
+        let filename = file.file_name().into_string();
+        if let Err(os_str_name) = filename {
+            eprintln!("Cleanup: Error reading filename of {:#?}", os_str_name);
+            continue;
+        }
+        let filename = filename.unwrap();
+        let date_parse_result = NaiveDate::parse_from_str(&filename, &file_format);
+        if let Err(err) = date_parse_result {
+            eprintln!(
+                "Cleanup: Not removing file {}, it is not log file. Reason: {}",
+                filename, err
+            );
+            continue;
+        }
+        let file_date = date_parse_result.unwrap();
+
+        if file_date < last_allowed_date {
+            if let Err(err) = fs::remove_file(file.path()) {
+                eprintln!(
+                    "Cleanup: Error removing suitable file {:#?}. Reason {}",
+                    file.path(),
+                    err
+                );
+                continue;
+            } else {
+                println!("Removed old log for {:#?}", file.path());
+            }
+        }
+    }
 }

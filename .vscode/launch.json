@@ -7,12 +7,12 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug executable 'screen-time-daemon-rs'",
+            "name": "Debug executable 'screen-time-daemon'",
             "cargo": {
                 "args": [
                     "build",
-                    "--bin=screen-time-daemon-rs",
-                    "--package=screen-time-daemon-rs"
+                    "--bin=screen-time-daemon",
+                    "--package=screen-time-daemon"
                 ],
                 "filter": {
                     "kind": "bin"
@@ -24,13 +24,13 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug unit tests in executable 'screen-time-daemon-rs'",
+            "name": "Debug unit tests in executable 'screen-time-daemon'",
             "cargo": {
                 "args": [
                     "test",
                     "--no-run",
-                    "--bin=screen-time-daemon-rs",
-                    "--package=screen-time-daemon-rs"
+                    "--bin=screen-time-daemon",
+                    "--package=screen-time-daemon"
                 ],
                 "filter": {
                     "kind": "bin"
