@@ -10,8 +10,8 @@ use std::process::Command;
 use chrono::{Date, Local, NaiveDate};
 
 static DELIM: &'static str = ";";
-static TIMEOUT: u64 = 3;
-static DATE_FORMAT: &'static str = "%b-%e-%Y";
+static TIMEOUT: u64 = 10;
+static DATE_FORMAT: &'static str = "%b-%d-%Y";
 
 #[derive(Debug)]
 enum DaemonError {
@@ -90,6 +90,7 @@ fn main() {
         let active_app_name = request_active_app_name();
         if let Err(err) = active_app_name {
             eprintln!("Error reading active app name, {:?}", err);
+            state.last_frame = None;
             continue;
         };
         let active_app_name = active_app_name.unwrap();
@@ -97,6 +98,7 @@ fn main() {
         println!("Active app name: {}", active_app_name);
 
         if should_ignore_app(&active_app_name) {
+            state.last_frame = None;
             continue;
         }
 
