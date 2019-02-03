@@ -1,4 +1,5 @@
-use std::io::{Seek, SeekFrom, Write};
+use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::{Duration, SystemTime};
 
 use std::fs;
@@ -17,6 +18,7 @@ static DATE_FORMAT: &'static str = "%b-%d-%Y";
 enum DaemonError {
     XpropWinIdParse,
     XpropClassParse,
+    XpropDesktopPathParse,
 }
 
 //activity frame
@@ -39,6 +41,8 @@ struct CurrentState {
     last_write_length: usize,
     last_date: Date<Local>,
     file: File,
+    app_info: File,
+    app_info_map: HashMap<String, String>,
 }
 
 impl CurrentState {
@@ -51,11 +55,22 @@ impl CurrentState {
             .open(path.join(filename))
             .expect("Cannot open or create todays screen time log");
 
+        let mut app_info = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path.join("app-names.csv"))
+            .expect("Cannot open or create app info log");
+
+        let app_info_map = read_desktop_paths(&mut app_info).unwrap();
+
         CurrentState {
             last_frame: None,
             last_write_length: 0usize,
             last_date: Local::today(),
-            file: file,
+            file,
+            app_info,
+            app_info_map,
         }
     }
 }
@@ -87,7 +102,16 @@ fn main() {
             clean_up_old_logs(&path_buf);
         }
 
-        let active_app_name = request_active_app_name();
+        let active_win_id = match get_active_win_id() {
+            Ok(win_id) => win_id,
+            Err(err) => {
+                eprintln!("Error reading active window ID, {:?}", err);
+                state.last_frame = None;
+                continue;
+            }
+        };
+
+        let active_app_name = get_app_name(&active_win_id);
         if let Err(err) = active_app_name {
             eprintln!("Error reading active app name, {:?}", err);
             state.last_frame = None;
@@ -95,11 +119,23 @@ fn main() {
         };
         let active_app_name = active_app_name.unwrap();
 
-        println!("Active app name: {}", active_app_name);
-
         if should_ignore_app(&active_app_name) {
+            println!("Ignoring system app");
             state.last_frame = None;
             continue;
+        }
+
+        println!("Active app: {}", active_app_name);
+
+        if !state.app_info_map.contains_key(&active_app_name) {
+            let desktop_path = get_desktop_file_path(&active_win_id);
+            match desktop_path {
+                Ok(path) => {
+                    state.app_info_map.insert(active_app_name.clone(), path);
+                    save_app_info(&state.app_info_map, &mut state.app_info);
+                }
+                Err(_) => (),
+            }
         }
 
         let frame_op = decide(&state.last_frame, &active_app_name);
@@ -110,7 +146,7 @@ fn main() {
                 let main_part = format!("{}{}{}{}", frame.name, DELIM, frame.start, DELIM);
                 state
                     .file
-                    .write(main_part.as_bytes())
+                    .write_all(main_part.as_bytes())
                     .expect("Error writing to file");
                 state.last_write_length = write_timestamp_and_flush(&mut state.file, frame.end);
                 frame
@@ -138,10 +174,10 @@ fn main() {
 
 fn write_timestamp_and_flush(file: &mut File, timestamp: u64) -> usize {
     let time_str = format!("{}\n", timestamp);
-    let res = file.write(time_str.as_bytes());
-    let written_bytes = res.unwrap();
+    let time_str_len = time_str.as_bytes().len();
+    let res = file.write_all(time_str.as_bytes());
     file.sync_data().expect("Cannot flush data to file");
-    written_bytes
+    time_str_len
 }
 
 fn decide(last_frame: &Option<Frame>, name: &str) -> FrameOperation {
@@ -196,15 +232,40 @@ fn should_ignore_app(app_name: &str) -> bool {
     return false;
 }
 
-fn request_active_app_name() -> Result<String, DaemonError> {
+fn get_active_win_id() -> Result<String, DaemonError> {
     let output = Command::new("xprop")
         .arg("-root")
         .arg("_NET_ACTIVE_WINDOW")
         .output()
         .expect("Failed to execute xprop. Do you have xprop installed?");
     let output_str = String::from_utf8(output.stdout).map_err(|_| DaemonError::XpropWinIdParse)?;
-    let win_id = get_last_word(output_str);
+    output_str
+        .split(" ")
+        .last()
+        .map(|word| word.to_string())
+        .ok_or(DaemonError::XpropWinIdParse)
+}
 
+fn get_desktop_file_path(win_id: &str) -> Result<String, DaemonError> {
+    let output = Command::new("xprop")
+        .arg("-id")
+        .arg(win_id)
+        .arg("_BAMF_DESKTOP_FILE")
+        .output()
+        .expect("Failed to execute xprop. Do you have xprop installed?");
+    let output_str =
+        String::from_utf8(output.stdout).map_err(|_| DaemonError::XpropDesktopPathParse)?;
+
+    let path_start = output_str.find('=');
+    let path_end = output_str.len();
+    if path_start.is_none() {
+        return Err(DaemonError::XpropDesktopPathParse);
+    }
+    let path = &output_str[path_start.unwrap() + 3..path_end - 2];
+    return Ok(path.to_string());
+}
+
+fn get_app_name(win_id: &str) -> Result<String, DaemonError> {
     let output = Command::new("xprop")
         .arg("-id")
         .arg(win_id)
@@ -226,13 +287,8 @@ fn request_active_app_name() -> Result<String, DaemonError> {
     return Ok(name.to_string());
 }
 
-fn get_last_word(string: String) -> String {
-    let words = string.split(" ");
-    return words.last().unwrap().to_string();
-}
-
 fn clean_up_old_logs(path: &PathBuf) {
-    let last_allowed_date = Local::today() - chrono::Duration::days(7);
+    let last_allowed_date = Local::today() - chrono::Duration::days(14);
     let last_allowed_date = last_allowed_date.naive_local();
     let file_format = format!("{}.csv", DATE_FORMAT);
 
@@ -270,5 +326,29 @@ fn clean_up_old_logs(path: &PathBuf) {
                 println!("Removed old log for {:#?}", file.path());
             }
         }
+    }
+}
+
+fn read_desktop_paths(file: &mut File) -> std::io::Result<HashMap<String, String>> {
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+
+    let mut map = HashMap::new();
+    for line in text.lines() {
+        let words: Vec<&str> = line.split(DELIM).collect();
+        if words.len() != 2 {
+            eprintln!("Skipping line from desktop paths file");
+            continue;
+        }
+        map.insert(words[0].to_string(), words[1].to_string());
+    }
+    Ok(map)
+}
+
+fn save_app_info(map: &HashMap<String, String>, file: &mut File) {
+    let _ = file.seek(SeekFrom::Start(0)).unwrap();
+    for (key, value) in map {
+        let line = format!("{}{}{}\n", key, DELIM, value);
+        let _ = file.write_all(line.as_bytes());
     }
 }
