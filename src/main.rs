@@ -15,10 +15,10 @@ static TIMEOUT: u64 = 10;
 static DATE_FORMAT: &'static str = "%b-%d-%Y";
 
 #[derive(Debug)]
-enum DaemonError {
-    XpropWinIdParse,
-    XpropClassParse,
-    XpropDesktopPathParse,
+enum XpropParseError {
+    WinId,
+    Class,
+    DesktopPath,
 }
 
 //activity frame
@@ -79,7 +79,7 @@ fn main() {
     let mut path_buf = dirs::home_dir().unwrap();
     path_buf.push(".screen-time");
     if !path_buf.exists() {
-        create_dir(path_buf.as_path()).expect("cannot create .screen-time folder in your HOME");
+        create_dir(path_buf.as_path()).expect("Couldn't create .screen-time folder in your HOME");
     } else {
         clean_up_old_logs(&path_buf);
     }
@@ -129,12 +129,9 @@ fn main() {
 
         if !state.app_info_map.contains_key(&active_app_name) {
             let desktop_path = get_desktop_file_path(&active_win_id);
-            match desktop_path {
-                Ok(path) => {
-                    state.app_info_map.insert(active_app_name.clone(), path);
-                    save_app_info(&state.app_info_map, &mut state.app_info);
-                }
-                Err(_) => (),
+            if let Ok(path) = desktop_path {
+                state.app_info_map.insert(active_app_name.clone(), path);
+                save_app_info(&state.app_info_map, &mut state.app_info);
             }
         }
 
@@ -175,8 +172,8 @@ fn main() {
 fn write_timestamp_and_flush(file: &mut File, timestamp: u64) -> usize {
     let time_str = format!("{}\n", timestamp);
     let time_str_len = time_str.as_bytes().len();
-    let res = file.write_all(time_str.as_bytes());
-    file.sync_data().expect("Cannot flush data to file");
+    file.write_all(time_str.as_bytes()).unwrap_or_else(|_| eprintln!("Couldn't write activity log"));
+    file.sync_data().expect("Couldn't flush data to file");
     time_str_len
 }
 
@@ -222,31 +219,30 @@ fn should_ignore_app(app_name: &str) -> bool {
     let system_apps = &["Desktop", "unity-panel", "wingpanel"];
     if system_apps
         .iter()
-        .position(|&name| name == app_name)
-        .is_some()
+        .any(|&name| name == app_name)
     {
         println!("Ignoring system app");
         return true;
     }
 
-    return false;
+    false
 }
 
-fn get_active_win_id() -> Result<String, DaemonError> {
+fn get_active_win_id() -> Result<String, XpropParseError> {
     let output = Command::new("xprop")
         .arg("-root")
         .arg("_NET_ACTIVE_WINDOW")
         .output()
         .expect("Failed to execute xprop. Do you have xprop installed?");
-    let output_str = String::from_utf8(output.stdout).map_err(|_| DaemonError::XpropWinIdParse)?;
+    let output_str = String::from_utf8(output.stdout).map_err(|_| XpropParseError::WinId)?;
     output_str
-        .split(" ")
+        .split(' ')
         .last()
         .map(|word| word.to_string())
-        .ok_or(DaemonError::XpropWinIdParse)
+        .ok_or(XpropParseError::WinId)
 }
 
-fn get_desktop_file_path(win_id: &str) -> Result<String, DaemonError> {
+fn get_desktop_file_path(win_id: &str) -> Result<String, XpropParseError> {
     let output = Command::new("xprop")
         .arg("-id")
         .arg(win_id)
@@ -254,25 +250,25 @@ fn get_desktop_file_path(win_id: &str) -> Result<String, DaemonError> {
         .output()
         .expect("Failed to execute xprop. Do you have xprop installed?");
     let output_str =
-        String::from_utf8(output.stdout).map_err(|_| DaemonError::XpropDesktopPathParse)?;
+        String::from_utf8(output.stdout).map_err(|_| XpropParseError::DesktopPath)?;
 
     let path_start = output_str.find('=');
     let path_end = output_str.len();
     if path_start.is_none() {
-        return Err(DaemonError::XpropDesktopPathParse);
+        return Err(XpropParseError::DesktopPath);
     }
     let path = &output_str[path_start.unwrap() + 3..path_end - 2];
-    return Ok(path.to_string());
+    Ok(path.to_string())
 }
 
-fn get_app_name(win_id: &str) -> Result<String, DaemonError> {
+fn get_app_name(win_id: &str) -> Result<String, XpropParseError> {
     let output = Command::new("xprop")
         .arg("-id")
         .arg(win_id)
         .arg("WM_CLASS")
         .output()
         .expect("Failed to execute xprop. Do you have xprop installed?");
-    let output_str = String::from_utf8(output.stdout).map_err(|_| DaemonError::XpropClassParse)?;
+    let output_str = String::from_utf8(output.stdout).map_err(|_| XpropParseError::Class)?;
 
     //wm class line looks like
     //WM_CLASS(STRING) = "chromium-browser", "Chromium-browser"
@@ -281,10 +277,10 @@ fn get_app_name(win_id: &str) -> Result<String, DaemonError> {
     let name_start = output_str.find('=');
     let name_end = output_str.find(',');
     if name_start.is_none() || name_end.is_none() {
-        return Err(DaemonError::XpropClassParse);
+        return Err(XpropParseError::Class);
     }
     let name = &output_str[name_start.unwrap() + 3..name_end.unwrap() - 1];
-    return Ok(name.to_string());
+    Ok(name.to_string())
 }
 
 fn clean_up_old_logs(path: &PathBuf) {
@@ -349,6 +345,6 @@ fn save_app_info(map: &HashMap<String, String>, file: &mut File) {
     let _ = file.seek(SeekFrom::Start(0)).unwrap();
     for (key, value) in map {
         let line = format!("{}{}{}\n", key, DELIM, value);
-        let _ = file.write_all(line.as_bytes());
+        file.write_all(line.as_bytes()).unwrap_or_else(|_| eprintln!("Couldn't save desktop paths file"));;
     }
 }
